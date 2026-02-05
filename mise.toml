@@ -141,6 +141,17 @@ depends = [
   "docker:build:cluster",
 ]
 
+[tasks."docker:build:ci"]
+description = "Build the CI Docker image"
+env = { DOCKER_BUILDKIT = "1" }
+run = """
+docker buildx build \
+  -f deploy/docker/Dockerfile.ci \
+  -t navigator-ci:${IMAGE_TAG:-dev} \
+  --load \
+  .
+"""
+
 [tasks."docker:build:sandbox"]
 description = "Build the sandbox Docker image"
 env = { DOCKER_BUILDKIT = "1" }

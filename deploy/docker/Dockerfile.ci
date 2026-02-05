@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1.4
+# CI runner image with all development tools pre-installed
+# Rebuild triggered automatically when mise.toml or this file changes
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV MISE_DATA_DIR=/opt/mise
+ENV MISE_CACHE_DIR=/opt/mise/cache
+ENV PATH="/opt/mise/shims:/root/.local/bin:$PATH"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    python3 \
+    python3-venv \
+    cmake \
+    protobuf-compiler \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install mise
+RUN curl https://mise.run | sh
+
+# Copy mise.toml and install all tools
+COPY mise.toml /opt/mise/mise.toml
+WORKDIR /opt/mise
+RUN mise trust /opt/mise/mise.toml && mise install
+
+# Set working directory for CI jobs
+WORKDIR /builds

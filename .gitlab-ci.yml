@@ -1,0 +1,88 @@
+stages:
+  - build-ci-image
+  - lint
+  - test
+
+variables:
+  CARGO_TERM_COLOR: "always"
+  CI_IMAGE: $CI_REGISTRY_IMAGE/ci:latest
+
+default:
+  image: $CI_IMAGE
+  tags:
+    - os/linux
+    - type/docker
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - target/
+    - .venv/
+
+# Install Python dependencies (cached in .venv/)
+before_script:
+  - uv sync --frozen
+
+# =============================================================================
+# CI Image Build (runs only when dependencies change)
+# =============================================================================
+build_ci_image:
+  stage: build-ci-image
+  image: docker:24
+  services:
+    - docker:24-dind
+  tags:
+    - os/linux
+    - type/docker
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_BUILDKIT: "1"
+  before_script: []  # Override default before_script (docker:24 doesn't have uv)
+  rules:
+    - changes:
+        - deploy/docker/Dockerfile.ci
+        - mise.toml
+      when: always
+    - when: manual
+      allow_failure: true
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - |
+      docker build \
+        --cache-from $CI_IMAGE \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -f deploy/docker/Dockerfile.ci \
+        -t $CI_IMAGE \
+        .
+    - docker push $CI_IMAGE
+
+# =============================================================================
+# Lint Jobs
+# =============================================================================
+fmt_check:
+  stage: lint
+  script:
+    - mise run fmt:check
+
+clippy:
+  stage: lint
+  script:
+    - mise run clippy
+
+python_lint:
+  stage: lint
+  script:
+    - mise run python:lint
+
+# =============================================================================
+# Test Jobs
+# =============================================================================
+rust_test:
+  stage: test
+  script:
+    - mise run test:rust
+
+python_test:
+  stage: test
+  script:
+    - mise run test:python
