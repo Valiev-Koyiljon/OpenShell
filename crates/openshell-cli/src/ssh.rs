@@ -447,23 +447,43 @@ pub(crate) async fn sandbox_exec_without_exec(
     sandbox_exec_with_mode(server, name, command, tty, tls, false).await
 }
 
-/// Push a list of files from a local directory into a sandbox using tar-over-SSH.
+/// What to pack into the tar archive streamed to the sandbox.
+enum UploadSource {
+    /// A single local file or directory.  `tar_name` controls the entry name
+    /// inside the archive (e.g. the target basename for file-to-file uploads).
+    SinglePath {
+        local_path: PathBuf,
+        tar_name: std::ffi::OsString,
+    },
+    /// A set of files relative to a base directory (git-filtered uploads).
+    FileList {
+        base_dir: PathBuf,
+        files: Vec<String>,
+    },
+}
+
+/// Core tar-over-SSH upload: streams a tar archive into `dest_dir` on the
+/// sandbox.  Callers are responsible for splitting the destination path so
+/// that `dest_dir` is always a directory.
 ///
-/// This replaces the old rsync-based sync. Files are streamed as a tar archive
-/// to `ssh ... tar xf - -C <dest>` on the sandbox side.
-pub async fn sandbox_sync_up_files(
+/// When `dest_dir` is `None`, the sandbox user's home directory (`$HOME`) is
+/// used as the extraction target.  This avoids hard-coding any particular
+/// path and works for custom container images with non-default `WORKDIR`.
+async fn ssh_tar_upload(
     server: &str,
     name: &str,
-    base_dir: &Path,
-    files: &[String],
-    dest: &str,
+    dest_dir: Option<&str>,
+    source: UploadSource,
     tls: &TlsOptions,
 ) -> Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-
     let session = ssh_session_config(server, name, tls).await?;
+
+    // When no explicit destination is given, use the unescaped `$HOME` shell
+    // variable so the remote shell resolves it at runtime.
+    let escaped_dest = match dest_dir {
+        Some(d) => shell_escape(d),
+        None => "$HOME".to_string(),
+    };
 
     let mut ssh = ssh_base_command(&session.proxy_command);
     ssh.arg("-T")
@@ -471,9 +491,7 @@ pub async fn sandbox_sync_up_files(
         .arg("RequestTTY=no")
         .arg("sandbox")
         .arg(format!(
-            "mkdir -p {} && cat | tar xf - -C {}",
-            shell_escape(dest),
-            shell_escape(dest)
+            "mkdir -p {escaped_dest} && cat | tar xf - -C {escaped_dest}",
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
@@ -486,22 +504,43 @@ pub async fn sandbox_sync_up_files(
         .ok_or_else(|| miette::miette!("failed to open stdin for ssh process"))?;
 
     // Build the tar archive in a blocking task since the tar crate is synchronous.
-    let base_dir = base_dir.to_path_buf();
-    let files = files.to_vec();
     tokio::task::spawn_blocking(move || -> Result<()> {
         let mut archive = tar::Builder::new(stdin);
-        for file in &files {
-            let full_path = base_dir.join(file);
-            if full_path.is_file() {
-                archive
-                    .append_path_with_name(&full_path, file)
-                    .into_diagnostic()
-                    .wrap_err_with(|| format!("failed to add {file} to tar archive"))?;
-            } else if full_path.is_dir() {
-                archive
-                    .append_dir_all(file, &full_path)
-                    .into_diagnostic()
-                    .wrap_err_with(|| format!("failed to add directory {file} to tar archive"))?;
+        match source {
+            UploadSource::SinglePath {
+                local_path,
+                tar_name,
+            } => {
+                if local_path.is_file() {
+                    archive
+                        .append_path_with_name(&local_path, &tar_name)
+                        .into_diagnostic()?;
+                } else if local_path.is_dir() {
+                    archive.append_dir_all(".", &local_path).into_diagnostic()?;
+                } else {
+                    return Err(miette::miette!(
+                        "local path does not exist: {}",
+                        local_path.display()
+                    ));
+                }
+            }
+            UploadSource::FileList { base_dir, files } => {
+                for file in &files {
+                    let full_path = base_dir.join(file);
+                    if full_path.is_file() {
+                        archive
+                            .append_path_with_name(&full_path, file)
+                            .into_diagnostic()
+                            .wrap_err_with(|| format!("failed to add {file} to tar archive"))?;
+                    } else if full_path.is_dir() {
+                        archive
+                            .append_dir_all(file, &full_path)
+                            .into_diagnostic()
+                            .wrap_err_with(|| {
+                                format!("failed to add directory {file} to tar archive")
+                            })?;
+                    }
+                }
             }
         }
         archive.finish().into_diagnostic()?;
@@ -524,72 +563,112 @@ pub async fn sandbox_sync_up_files(
     Ok(())
 }
 
+/// Split a sandbox path into (parent_directory, basename).
+///
+/// Examples:
+///   `"/sandbox/.bashrc"`  -> `("/sandbox", ".bashrc")`
+///   `"/sandbox/sub/file"` -> `("/sandbox/sub", "file")`
+///   `"file.txt"`          -> `(".", "file.txt")`
+fn split_sandbox_path(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(pos) => (&path[..pos], &path[pos + 1..]),
+        None => (".", path),
+    }
+}
+
+/// Push a list of files from a local directory into a sandbox using tar-over-SSH.
+///
+/// Files are streamed as a tar archive to `ssh ... tar xf - -C <dest>` on
+/// the sandbox side.  When `dest` is `None`, files are uploaded to the
+/// sandbox user's home directory.
+pub async fn sandbox_sync_up_files(
+    server: &str,
+    name: &str,
+    base_dir: &Path,
+    files: &[String],
+    dest: Option<&str>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    ssh_tar_upload(
+        server,
+        name,
+        dest,
+        UploadSource::FileList {
+            base_dir: base_dir.to_path_buf(),
+            files: files.to_vec(),
+        },
+        tls,
+    )
+    .await
+}
+
 /// Push a local path (file or directory) into a sandbox using tar-over-SSH.
+///
+/// When `sandbox_path` is `None`, files are uploaded to the sandbox user's
+/// home directory.  When uploading a single file to an explicit destination
+/// that does not end with `/`, the destination is treated as a file path:
+/// the parent directory is created and the file is written with the
+/// destination's basename.  This matches `cp` / `scp` semantics.
 pub async fn sandbox_sync_up(
     server: &str,
     name: &str,
     local_path: &Path,
-    sandbox_path: &str,
+    sandbox_path: Option<&str>,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
-
-    let mut ssh = ssh_base_command(&session.proxy_command);
-    ssh.arg("-T")
-        .arg("-o")
-        .arg("RequestTTY=no")
-        .arg("sandbox")
-        .arg(format!(
-            "mkdir -p {} && cat | tar xf - -C {}",
-            shell_escape(sandbox_path),
-            shell_escape(sandbox_path)
-        ))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let mut child = ssh.spawn().into_diagnostic()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| miette::miette!("failed to open stdin for ssh process"))?;
-
-    let local_path = local_path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut archive = tar::Builder::new(stdin);
-        if local_path.is_file() {
-            let file_name = local_path
-                .file_name()
-                .ok_or_else(|| miette::miette!("path has no file name"))?;
-            archive
-                .append_path_with_name(&local_path, file_name)
-                .into_diagnostic()?;
-        } else if local_path.is_dir() {
-            archive.append_dir_all(".", &local_path).into_diagnostic()?;
-        } else {
-            return Err(miette::miette!(
-                "local path does not exist: {}",
-                local_path.display()
-            ));
+    // When an explicit destination is given and looks like a file path (does
+    // not end with '/'), split into parent directory + target basename so that
+    // `mkdir -p` creates the parent and tar extracts the file with the right
+    // name.
+    //
+    // Exception: if splitting would yield "/" as the parent (e.g. the user
+    // passed "/sandbox"), fall through to directory semantics instead.  The
+    // sandbox user cannot write to "/" and the intent is almost certainly
+    // "put the file inside /sandbox", not "create a file named sandbox in /".
+    if let Some(path) = sandbox_path {
+        if local_path.is_file() && !path.ends_with('/') {
+            let (parent, target_name) = split_sandbox_path(path);
+            if parent != "/" {
+                return ssh_tar_upload(
+                    server,
+                    name,
+                    Some(parent),
+                    UploadSource::SinglePath {
+                        local_path: local_path.to_path_buf(),
+                        tar_name: target_name.into(),
+                    },
+                    tls,
+                )
+                .await;
+            }
         }
-        archive.finish().into_diagnostic()?;
-        Ok(())
-    })
-    .await
-    .into_diagnostic()??;
-
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .into_diagnostic()?
-        .into_diagnostic()?;
-
-    if !status.success() {
-        return Err(miette::miette!(
-            "ssh tar extract exited with status {status}"
-        ));
     }
 
-    Ok(())
+    let tar_name = if local_path.is_file() {
+        local_path
+            .file_name()
+            .ok_or_else(|| miette::miette!("path has no file name"))?
+            .to_os_string()
+    } else {
+        // For directories the tar_name is unused — append_dir_all uses "."
+        ".".into()
+    };
+
+    ssh_tar_upload(
+        server,
+        name,
+        sandbox_path,
+        UploadSource::SinglePath {
+            local_path: local_path.to_path_buf(),
+            tar_name,
+        },
+        tls,
+    )
+    .await
 }
 
 /// Pull a path from a sandbox to a local destination using tar-over-SSH.
@@ -1148,5 +1227,26 @@ mod tests {
         let message = foreground_forward_started_message("demo", &spec);
         assert!(message.contains("Forwarding port 3000 to sandbox demo"));
         assert!(message.contains("Access at: http://localhost:3000/"));
+    }
+
+    #[test]
+    fn split_sandbox_path_separates_parent_and_basename() {
+        assert_eq!(
+            split_sandbox_path("/sandbox/.bashrc"),
+            ("/sandbox", ".bashrc")
+        );
+        assert_eq!(
+            split_sandbox_path("/sandbox/sub/file"),
+            ("/sandbox/sub", "file")
+        );
+        assert_eq!(split_sandbox_path("/a/b/c/d.txt"), ("/a/b/c", "d.txt"));
+    }
+
+    #[test]
+    fn split_sandbox_path_handles_root_and_bare_names() {
+        // File directly under root
+        assert_eq!(split_sandbox_path("/.bashrc"), ("/", ".bashrc"));
+        // No directory component at all
+        assert_eq!(split_sandbox_path("file.txt"), (".", "file.txt"));
     }
 }
