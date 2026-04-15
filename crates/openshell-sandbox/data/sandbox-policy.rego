@@ -183,19 +183,118 @@ _policy_allows_l7(policy) if {
 	request_allowed_for_endpoint(input.request, ep)
 }
 
-# L7 request allowed if any matching L4 policy also allows the L7 request.
+# L7 request allowed if any matching L4 policy also allows the L7 request
+# AND no deny rule blocks it. Deny rules take precedence over allow rules.
 allow_request if {
 	some name
 	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
 	_policy_allows_l7(policy)
+	not deny_request
+}
+
+# --- L7 deny rules ---
+#
+# Deny rules are evaluated after allow rules and take precedence.
+# If a request matches any deny rule on any matching endpoint, it is blocked
+# even if it would otherwise be allowed.
+
+default deny_request = false
+
+# Per-policy helper: true when this policy has at least one endpoint matching
+# the L4 request whose deny_rules also match the specific L7 request.
+_policy_denies_l7(policy) if {
+	some ep
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+	request_denied_for_endpoint(input.request, ep)
+}
+
+deny_request if {
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	_policy_denies_l7(policy)
+}
+
+# --- L7 deny rule matching: REST method + path + query ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.method
+	method_matches(request.method, deny_rule.method)
+	path_matches(request.path, deny_rule.path)
+	deny_query_params_match(request, deny_rule)
+}
+
+# --- L7 deny rule matching: SQL command ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.command
+	command_matches(request.command, deny_rule.command)
+}
+
+# Deny query matching: fail-closed semantics.
+# If no query rules on the deny rule, match unconditionally (any query params).
+# If query rules present, trigger the deny if ANY value for a configured key
+# matches the matcher. This is the inverse of allow-side semantics where ALL
+# values must match. For deny logic, a single matching value is enough to block.
+deny_query_params_match(request, deny_rule) if {
+	deny_query_rules := object.get(deny_rule, "query", {})
+	count(deny_query_rules) == 0
+}
+
+deny_query_params_match(request, deny_rule) if {
+	deny_query_rules := object.get(deny_rule, "query", {})
+	count(deny_query_rules) > 0
+	not deny_query_key_missing(request, deny_query_rules)
+	not deny_query_value_mismatch_all(request, deny_query_rules)
+}
+
+# A configured deny query key is missing from the request entirely.
+# Missing key means the deny rule doesn't apply (fail-open on absence).
+deny_query_key_missing(request, query_rules) if {
+	some key
+	query_rules[key]
+	request_query := object.get(request, "query_params", {})
+	values := object.get(request_query, key, null)
+	values == null
+}
+
+# ALL values for a configured key fail to match the matcher.
+# If even one value matches, deny fires. This rule checks the opposite:
+# true when NO value matches (i.e., every value is a mismatch).
+deny_query_value_mismatch_all(request, query_rules) if {
+	some key
+	matcher := query_rules[key]
+	request_query := object.get(request, "query_params", {})
+	values := object.get(request_query, key, [])
+	count(values) > 0
+	not deny_any_value_matches(values, matcher)
+}
+
+# True if at least one value in the list matches the matcher.
+deny_any_value_matches(values, matcher) if {
+	some i
+	query_value_matches(values[i], matcher)
 }
 
 # --- L7 deny reason ---
 
 request_deny_reason := reason if {
 	input.request
+	deny_request
+	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
+}
+
+request_deny_reason := reason if {
+	input.request
+	not deny_request
 	not allow_request
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
